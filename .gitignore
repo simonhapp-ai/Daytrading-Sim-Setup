@@ -1,0 +1,12 @@
+# Geheime Keys nie ins Repository
+.env
+.env.*
+keys.env.txt
+
+# Lokale Laufdaten
+reports/
+logs/
+decisions/
+__pycache__/
+*.pyc
+.DS_Store
