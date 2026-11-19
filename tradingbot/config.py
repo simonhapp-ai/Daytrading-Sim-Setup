@@ -70,7 +70,7 @@ class Settings:
     add_most_actives: int = 5          # zusätzlich die N aktivsten Aktien (Alpaca Screener)
     max_symbols: int = 20
     min_price: float = 5.0             # keine Penny-Stocks
-    min_dollar_volume: float = 2_000_000   # Ø Tagesumsatz in $ laut IEX-Feed (nur ~3 % des Gesamtmarkts)
+    min_dollar_volume: float = 50_000_000  # Ø Tagesumsatz in $ (Gesamtmarkt, SIP-Daten)
     # Risiko
     max_position_pct: float = 0.10     # max. Anteil des Eigenkapitals je Position
     max_open_positions: int = 5
@@ -82,6 +82,12 @@ class Settings:
     sell_score: float = -2.0           # Summe <= diesem Wert -> bestehende Position schließen
     flatten_minutes_before_close: int = 15  # Daytrading: kurz vor Schluss alles glattstellen
     allow_short: bool = False
+    # Vor- und Nachbörse (04:00–09:30 und 16:00–20:00 ET = 10:00–15:30 und 22:00–02:00 MEZ)
+    extended_hours: bool = True
+    ext_position_factor: float = 0.5   # halbe Positionsgröße außerhalb der Hauptbörse
+    ext_limit_offset_pct: float = 0.002  # Limit 0,2 % über Brief (Kauf) bzw. unter Geld (Verkauf)
+    ext_max_spread_pct: float = 0.3    # kein Kauf, wenn Geld-/Brief-Spanne größer
+    ext_extra_score: float = 0.5       # höhere Kaufschwelle außerhalb der Hauptbörse
 
 
 def load_settings() -> Settings:

@@ -49,23 +49,42 @@ class Alpaca:
                 http.request("DELETE", f"{self.base}/orders/{o['id']}", headers=self.h, retries=0)
 
     # --- Marktdaten ---
+    def calendar_today(self) -> list[dict]:
+        d = dt.datetime.now(dt.timezone(dt.timedelta(hours=-5))).date()  # grob ET, reicht für das Datum
+        return http.get(f"{self.base}/calendar", headers=self.h,
+                        params={"start": str(d - dt.timedelta(days=1)), "end": str(d + dt.timedelta(days=1))}) or []
+
     def bars(self, symbols: list[str], timeframe: str, days: int) -> dict[str, list[dict]]:
-        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        """Kurse aus dem Gesamtmarkt (SIP). Der Gratis-Plan erlaubt SIP nur mit 15 Min. Verzögerung,
+        deshalb endet die Abfrage 16 Min. vor jetzt. SIP enthält auch Vor- und Nachbörse."""
+        now = dt.datetime.now(dt.timezone.utc)
+        start = (now - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now - dt.timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
         out: dict[str, list[dict]] = {}
         token = None
         while True:
             r = http.get(f"{DATA_URL}/v2/stocks/bars", headers=self.h, params={
-                "symbols": ",".join(symbols), "timeframe": timeframe, "start": start,
-                "limit": 10000, "feed": "iex", "adjustment": "split", "page_token": token})
+                "symbols": ",".join(symbols), "timeframe": timeframe, "start": start, "end": end,
+                "limit": 10000, "feed": "sip", "adjustment": "split", "page_token": token})
             for sym, bs in (r.get("bars") or {}).items():
                 out.setdefault(sym, []).extend(bs)
             token = r.get("next_page_token")
             if not token:
                 return out
 
-    def snapshots(self, symbols: list[str]) -> dict:
-        return http.get(f"{DATA_URL}/v2/stocks/snapshots", headers=self.h,
-                        params={"symbols": ",".join(symbols), "feed": "iex"}) or {}
+    def quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Geld/Brief für Limit-Orders. Vor-/Nachbörse gibt es gratis nur als SIP mit ~15 Min.
+        Verzögerung (IEX handelt dort nicht). Das enge Limit schützt vor veralteten Kursen:
+        hat sich der Kurs weg bewegt, wird die Order einfach nicht ausgeführt."""
+        r = http.get(f"{DATA_URL}/v2/stocks/snapshots", headers=self.h,
+                     params={"symbols": ",".join(symbols), "feed": "delayed_sip"}) or {}
+        out = {}
+        for sym, snap in r.items():
+            q = (snap or {}).get("latestQuote") or {}
+            t = (snap or {}).get("latestTrade") or {}
+            out[sym] = {"bid": q.get("bp"), "ask": q.get("ap"), "quote_time": q.get("t"),
+                        "last": t.get("p"), "trade_time": t.get("t")}
+        return out
 
     def news(self, symbols: list[str], hours: int = 24) -> list[dict]:
         start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -89,7 +108,15 @@ class Finnhub:
     def enabled(self):
         return bool(self.key)
 
+    _last_call = 0.0
+
     def _get(self, path: str, **params):
+        # Gratis-Plan: max. 60 Aufrufe pro Minute -> gleichmäßig drosseln
+        import time
+        wait = Finnhub._last_call + 1.05 - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        Finnhub._last_call = time.monotonic()
         params["token"] = self.key
         return http.get(f"{self.URL}{path}", params=params)
 

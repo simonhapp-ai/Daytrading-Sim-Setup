@@ -11,5 +11,10 @@
   "min_total_score": 3.0,
   "min_agreeing_roles": 2,
   "sell_score": -2.0,
-  "flatten_minutes_before_close": 15
+  "flatten_minutes_before_close": 15,
+  "extended_hours": true,
+  "ext_position_factor": 0.5,
+  "ext_limit_offset_pct": 0.002,
+  "ext_max_spread_pct": 0.3,
+  "ext_extra_score": 0.5
 }

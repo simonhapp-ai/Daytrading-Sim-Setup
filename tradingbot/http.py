@@ -45,7 +45,7 @@ def request(method: str, url: str, params: dict | None = None, headers: dict | N
             msg = e.read().decode("utf-8", errors="replace")[:300]
             last = ApiError(_r(f"HTTP {e.code} bei {urllib.parse.urlsplit(url).netloc}{urllib.parse.urlsplit(url).path}: {msg}"))
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep((10 if e.code == 429 else 1.5) * (attempt + 1))
                 continue
             raise last
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:

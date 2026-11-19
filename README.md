@@ -6,6 +6,23 @@ wenn `ALPACA_BASE_URL` nicht auf `paper-api.alpaca.markets` zeigt.
 
 Keine Zusatzpakete nötig: nur Python 3.10+ (Standardbibliothek).
 
+## Handelszeiten
+
+Alpaca handelt nur US-Aktien, deshalb gelten US-Zeiten. Der Bot nutzt alle drei Sitzungen
+(genaue Zeiten inkl. Feiertagen kommen aus dem Alpaca-Kalender; in den Wochen der Zeitumstellung verschiebt sich alles um 1 Std.):
+
+| Sitzung | Deutsche Zeit | Orders | Größe |
+|---|---|---|---|
+| Vorbörse | 10:00–15:30 | nur Limit-Orders (`extended_hours`), Limit 0,2 % über Brief | halbe Größe, Kaufschwelle +0,5 |
+| Hauptbörse | 15:30–22:00 | Market-Order mit Stop-Loss/Gewinnziel (Bracket) | normal |
+| Nachbörse | 22:00–02:00 | nur Limit-Orders, Limit 0,2 % über Brief / unter Geld | halbe Größe, Kaufschwelle +0,5 |
+
+Außerhalb der Hauptbörse gibt es weniger Umsatz und breitere Spannen. Deshalb: kein Kauf bei einer
+Geld-/Brief-Spanne über 0,3 %, und weil Alpaca dort keine Bracket-Orders erlaubt, prüft der Bot bei jedem Lauf
+selbst Stop-Loss und Gewinnziel und verkauft per Limit-Order. Kurse für Vor-/Nachbörse kommen gratis nur
+mit ~15 Min. Verzögerung; das enge Limit sorgt dafür, dass bei veraltetem Kurs einfach nichts ausgeführt wird.
+Glattgestellt wird 15 Min. vor Ende der Hauptbörse und vor Ende der Nachbörse. Abschalten: `"extended_hours": false` in `settings.json`.
+
 ## Die Rollen
 
 | Rolle | Datenquelle | Worauf sie achtet |
@@ -13,7 +30,7 @@ Keine Zusatzpakete nötig: nur Python 3.10+ (Standardbibliothek).
 | Insider-Beobachter | Finnhub Insider-Transaktionen, SEC EDGAR (Form 4, 8-K, 13D/G) | Insider-Käufe (stark positiv), große Verkaufswellen, Beteiligungsmeldungen |
 | Analyst | Alpaca News, Finnhub Firmen-News + Analystenkonsens + KGV, FMP Profil | Ton der Nachrichten, Analysten-Empfehlungen, Bewertung, anstehende Quartalszahlen |
 | Politik-Analyst | Finnhub Wirtschafts-News (+ Politiker-Trades, falls Premium-Zugang) | Zölle, Sanktionen, Fed, Regulierung, Kongress im Zusammenhang mit dem Unternehmen; Makro-Stimmung |
-| Quant | Alpaca Kurse (Tag + 15 Min, IEX-Feed) | Trend (SMA20/50), RSI, VWAP, Momentum, Volumen-Ausbrüche |
+| Quant | Alpaca Kurse (Tag + 15 Min, Gesamtmarkt, 15 Min. verzögert) | Trend (SMA20/50), RSI, VWAP, Momentum, Volumen-Ausbrüche |
 | Risikomanager | Konto, Positionen, Börsenuhr | Entscheidet final, hat Veto (siehe unten) |
 
 Jede Rolle gibt einen Score von −2 bis +2 mit Begründung. **Kauf** nur, wenn die Summe ≥ 3 ist und
@@ -42,8 +59,10 @@ python3 -m tradingbot flatten --execute      # alle Positionen schließen
 ```
 
 Jeder Lauf schreibt `reports/<Zeit>_<modus>.md` (lesbarer Bericht) und `.json` (vollständiges Briefing),
-dazu `reports/latest.md` / `latest.json`, `logs/runs.log` und `logs/trades.csv`.
-Orders werden nur bei geöffneter Börse gesendet (15:30–22:00 MEZ).
+dazu `reports/latest.md` / `latest.json`, `logs/runs.log` und `logs/trades.csv`. Danach exportiert
+jeder Lauf automatisch `dashboard/portfolio.json` und `dashboard/chat.json` für die Dashboard-Artefakte
+(ohne Keys; einzeln: `python3 -m tradingbot.dashboard`).
+Orders werden nur in einer erlaubten Sitzung gesendet (siehe Handelszeiten).
 
 ## Zwei Betriebsarten
 
@@ -62,20 +81,25 @@ weil Claude in der geplanten Aufgabe selbst urteilt:
    ]}
    ```
    `action`: BUY, SELL oder HOLD. `size` (0.1–1) skaliert die Positionsgröße innerhalb des 10-%-Limits.
+   Optional für den Agenten-Chat im Dashboard: `"discussion": [{"role": "Quant", "symbol": "AMZN", "text": "..."}]`
+   (Rollen widersprechen oder bestätigen sich gegenseitig) und `"summary": "..."` (Fazit der Runde in 1–3 Sätzen).
 3. `python3 -m tradingbot apply decisions/<Zeit>.json --execute` – der Risikomanager prüft die harten
    Regeln trotzdem und kann jede Entscheidung per Veto stoppen.
 
-Vorschlag für den Prompt der stündlichen Aufgabe (Mo–Fr, 15:45–21:45 MEZ):
+Vorschlag für den Prompt der stündlichen Aufgabe (Mo–Fr, stündlich 10:15–01:15 MEZ, mit Vor- und Nachbörse):
 
 > Im Ordner „Daytrading Sim": Führe `python3 -m tradingbot run` aus und lies `reports/latest.md`
 > (Details in `latest.json`). Bewerte als Gruppe aus Insider-Beobachter, Analyst, Politik-Analyst und
 > Quant die Kandidaten, achte auf echte Neuigkeiten und Muster. Schreibe deine Entscheidungen nach
-> `decisions/<Datum_Uhrzeit>.json` und führe `python3 -m tradingbot apply <Datei> --execute` aus.
+> `decisions/<Datum_Uhrzeit>.json`, mit einem Feld `discussion` (kurze Wortmeldungen der Rollen zu den
+> wichtigsten Aktien, gern mit Widerspruch) und `summary` (Fazit der Runde), und führe
+> `python3 -m tradingbot apply <Datei> --execute` aus.
 > Fasse danach in 5 Sätzen zusammen, was gekauft/verkauft wurde und warum.
 
 ## Bekannte Grenzen
 
 - Politiker-Trades (Kongress/Senat) sind bei Finnhub und FMP nur im Bezahlplan verfügbar; der
   Politik-Analyst nutzt deshalb vorerst Nachrichten. Der Code versucht die Endpunkte und überspringt sie ohne Zugriff.
-- Der kostenlose Alpaca-Kursfeed (IEX) zeigt nur einen Teil des Handelsvolumens.
+- Kurse sind im Gratis-Plan 15 Minuten verzögert (Gesamtmarkt). Für stündliche Entscheidungen reicht das.
+- Finnhub erlaubt 60 Aufrufe pro Minute; der Bot drosselt sich selbst, ein Lauf dauert deshalb etwa 2 Minuten.
 - Simulation zu Lern- und Testzwecken, keine Anlageberatung.

@@ -62,7 +62,8 @@ class Run:
         account = self.alp.account()
         positions = self.alp.positions() or []
         clock = self.alp.clock()
-        st = risk.portfolio_state(account, positions, clock)
+        calendar = self.safe("Alpaca Kalender", self.alp.calendar_today, [])
+        st = risk.portfolio_state(account, positions, clock, calendar, self.s)
 
         symbols = list(dict.fromkeys(s.upper() for s in self.s.watchlist))
         if self.s.add_most_actives:
@@ -85,6 +86,7 @@ class Run:
         intra = self.safe("Alpaca 15-Min-Kurse", lambda: self.alp.bars(symbols, "15Min", 5), {})
         metrics = {s: agents.quant_metrics(daily.get(s, []), intra.get(s, [])) for s in symbols}
         alp_news = self.safe("Alpaca News", lambda: self.alp.news(symbols, 24), [])
+        quotes = self.safe("Alpaca Quotes", lambda: self.alp.quotes(symbols), {}) if st["extended"] else {}
 
         general_news, earnings = [], []
         if self.fh.enabled:
@@ -144,7 +146,8 @@ class Run:
                 "earnings_soon": sym in earnings_soon,
             }
         return {"account": account, "state": st, "clock": clock, "symbols": symbols, "metrics": metrics,
-                "opinions": opinions, "details": details, "macro": macro, "earnings_soon": earnings_soon}
+                "opinions": opinions, "details": details, "macro": macro, "earnings_soon": earnings_soon,
+                "quotes": quotes}
 
     # ---------- Ausführen ----------
     def execute(self, decisions: list[dict], st: dict, execute: bool) -> list[dict]:
@@ -155,14 +158,17 @@ class Run:
             r = {"symbol": d["symbol"], "action": d["final"], "status": "Vorschau (Trockenlauf)"}
             if execute:
                 if not st["market_open"]:
-                    r["status"] = "nicht gesendet: Börse geschlossen"
+                    r["status"] = f"nicht gesendet: keine erlaubte Handelszeit ({risk.SESSION_DE[st['session']]})"
                 else:
                     try:
                         if d["final"] == "BUY":
                             o = self.alp.submit_order(d["order"])
                         else:
                             self.safe("Orders stornieren", lambda: self.alp.cancel_orders_for(d["symbol"]), None)
-                            o = self.alp.close_position(d["symbol"])
+                            if d.get("order"):  # Vor-/Nachbörse: Limit-Verkauf
+                                o = self.alp.submit_order(d["order"])
+                            else:
+                                o = self.alp.close_position(d["symbol"])
                         r["status"] = f"gesendet (Order {o.get('id', '?')[:8]}, {o.get('status')})"
                         r["order_id"] = o.get("id")
                     except Exception as e:
@@ -178,9 +184,10 @@ def fmt_report(mode: str, g: dict, decisions: list[dict], results: list[dict], r
     L = [f"# Entscheidungslauf {t:%d.%m.%Y %H:%M} ({mode}, {'PAPER-ORDERS' if execute else 'Trockenlauf'})", ""]
     L += ["## Konto (Alpaca Paper)",
           f"- Eigenkapital: ${st['equity']:,.2f} · Cash: ${st['cash']:,.2f} · Kaufkraft: ${st['buying_power']:,.2f}",
-          f"- Tages-P&L: {st['day_pnl_pct']:+.2f}% · Börse: {'offen' if st['market_open'] else 'geschlossen'}"
-          + (f" · {st['minutes_to_close']:.0f} Min. bis Schluss" if st['market_open'] and st['minutes_to_close'] else
-             f" · nächste Öffnung {g['clock'].get('next_open', '?')}"),
+          f"- Tages-P&L: {st['day_pnl_pct']:+.2f}% · Sitzung: {risk.SESSION_DE[st['session']]}"
+          + (" (Handel erlaubt" + (", nur Limit-Orders, halbe Größe" if st['extended'] else "") + ")" if st['market_open'] else " (kein Handel)")
+          + (f" · {st['minutes_to_close']:.0f} Min. bis Sitzungsende" if st['minutes_to_close'] else
+             f" · nächste Hauptbörse {g['clock'].get('next_open', '?')}"),
           f"- Offene Positionen: {', '.join(f'{s} ({float(p['unrealized_plpc'])*100:+.1f}%)' for s, p in st['open_positions'].items()) or 'keine'}",
           f"- Datenquellen: {', '.join(sorted(run.sources_used))}", ""]
     m = g["macro"]
@@ -197,7 +204,8 @@ def fmt_report(mode: str, g: dict, decisions: list[dict], results: list[dict], r
     vetoed = [d for d in decisions if d.get("vetoes") and d.get("final") == "HOLD"]
     if vetoed:
         L += ["", "**Veto des Risikomanagers:**"]
-        L += [f"- {d['symbol']} (Score {d.get('score', 0):+.1f}): {'; '.join(d['vetoes'])}" for d in vetoed]
+        L += [f"- {d['action']} {d['symbol']}" + (f" (Score {d.get('score', 0):+.1f})" if d.get("action") == "BUY" else "")
+              + f": {'; '.join(d['vetoes'])}" for d in vetoed]
     L += ["", "## Bewertungen je Aktie", "", "| Aktie | Insider | Analyst | Politik | Quant | Summe | Kurs | Entscheidung |",
           "|---|---|---|---|---|---|---|---|"]
     order = sorted(g["symbols"], key=lambda s: -sum(o.score for o in g["opinions"][s]))
@@ -231,6 +239,7 @@ def write_outputs(mode: str, g: dict, decisions: list, results: list, run: Run, 
         "macro": g["macro"],
         "symbols": {s: {**g["details"][s], "opinions": [o.as_dict() for o in g["opinions"][s]]} for s in g["symbols"]},
         "decisions": decisions, "results": results, "source_errors": run.errors,
+        "decision_file": g.get("decision_file"),
     }
     (REPORTS / f"{stem}.json").write_text(json.dumps(briefing, indent=1, default=str, ensure_ascii=False), encoding="utf-8")
     (REPORTS / "latest.md").write_text(md.read_text(encoding="utf-8"), encoding="utf-8")
@@ -263,20 +272,31 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     run = Run()
+
+    def light_state():
+        acc, pos, clk = run.alp.account(), run.alp.positions() or [], run.alp.clock()
+        cal = run.safe("Alpaca Kalender", run.alp.calendar_today, [])
+        return risk.portfolio_state(acc, pos, clk, cal, run.s)
+
     if a.cmd == "status":
-        acc, pos, clk = run.alp.account(), run.alp.positions(), run.alp.clock()
-        st = risk.portfolio_state(acc, pos, clk)
+        st = light_state()
         print(f"Paper-Konto: Eigenkapital ${st['equity']:,.2f}, Cash ${st['cash']:,.2f}, Tages-P&L {st['day_pnl_pct']:+.2f}%, "
-              f"Börse {'offen' if st['market_open'] else 'geschlossen'}")
+              f"Sitzung: {risk.SESSION_DE[st['session']]} ({'Handel erlaubt' if st['market_open'] else 'kein Handel'}"
+              + (f", {st['minutes_to_close']:.0f} Min. bis Sitzungsende)" if st['minutes_to_close'] else ")"))
         for s, p in st["open_positions"].items():
             print(f"  {s}: {p['qty']} Stk. @ {p['avg_entry_price']} -> {p['current_price']} ({float(p['unrealized_plpc'])*100:+.2f}%)")
         print(f"  offene Orders: {len(run.alp.open_orders() or [])}")
         return
 
     if a.cmd == "flatten":
-        acc, pos, clk = run.alp.account(), run.alp.positions(), run.alp.clock()
-        st = risk.portfolio_state(acc, pos, clk)
-        dec = [{"symbol": s, "action": "CLOSE", "final": "CLOSE", "why": "manuell glattstellen", "vetoes": []} for s in st["open_positions"]]
+        st = light_state()
+        syms = list(st["open_positions"])
+        quotes = run.safe("Alpaca Quotes", lambda: run.alp.quotes(syms), {}) if st["extended"] and syms else {}
+        dec = risk.enforce([{"symbol": s, "action": "CLOSE", "why": "manuell glattstellen"} for s in syms],
+                           {}, st, run.s, {}, set(), quotes)
+        for d in dec:
+            if d.get("vetoes"):
+                print(f"{d['symbol']}: nicht geschlossen ({'; '.join(d['vetoes'])})")
         res = run.execute(dec, st, a.execute)
         for r in res:
             print(f"{r['symbol']}: {r['status']}")
@@ -286,7 +306,7 @@ def main(argv=None):
 
     g = run.gather()
     if a.cmd == "run":
-        decisions = risk.decide(g["symbols"], g["opinions"], g["metrics"], g["state"], run.s, g["macro"], g["earnings_soon"])
+        decisions = risk.decide(g["symbols"], g["opinions"], g["metrics"], g["state"], run.s, g["macro"], g["earnings_soon"], g["quotes"])
         mode = "regelbasiert"
     else:
         raw = json.loads(Path(a.file).read_text(encoding="utf-8"))
@@ -299,12 +319,20 @@ def main(argv=None):
                 g["metrics"][sym] = agents.quant_metrics(
                     run.safe("Alpaca Kurse", lambda: run.alp.bars([sym], "1Day", 100), {}).get(sym, []),
                     run.safe("Alpaca Kurse", lambda: run.alp.bars([sym], "15Min", 5), {}).get(sym, []))
+            if g["state"]["extended"] and sym not in g["quotes"]:
+                g["quotes"].update(run.safe("Alpaca Quotes", lambda: run.alp.quotes([sym]), {}))
             props.append({"symbol": sym, "action": act, "score": float(it.get("conviction", 3)),
                           "size_factor": float(it.get("size", 1.0)), "why": f"Claude: {it.get('reason', '')}", "from_claude": True})
-        decisions = risk.enforce(props, g["metrics"], g["state"], run.s, g["macro"], g["earnings_soon"])
+        decisions = risk.enforce(props, g["metrics"], g["state"], run.s, g["macro"], g["earnings_soon"], g["quotes"])
         mode = "claude"
+        g["decision_file"] = str(Path(a.file).resolve())
     results = run.execute(decisions, g["state"], a.execute)
     md = write_outputs(mode, g, decisions, results, run, a.execute)
+    try:  # Daten für Portfolio-Dashboard und Agenten-Chat aktualisieren
+        from . import dashboard
+        dashboard.main()
+    except Exception as e:
+        print(f"Dashboard-Export fehlgeschlagen: {run.sec.redact(str(e))[:200]}")
     acts = [f"{d['final']} {d['symbol']}" for d in decisions if d.get("final") in ("BUY", "CLOSE")]
     print(f"Bericht: {md}")
     print(f"Entscheidungen: {', '.join(acts) or 'keine Trades'}")
