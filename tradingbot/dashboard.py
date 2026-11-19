@@ -163,7 +163,15 @@ def chat() -> dict:
             continue
         t = dt.datetime.fromisoformat(b["time"])
         st = b.get("state", {})
-        claude_file = _decision_file_for(t, used) if b.get("mode") == "claude" else None
+        claude_file = None
+        if b.get("decision_file") and Path(b["decision_file"]).exists():
+            try:
+                claude_file = json.loads(Path(b["decision_file"]).read_text(encoding="utf-8"))
+                used.add(Path(b["decision_file"]))
+            except Exception:
+                claude_file = None
+        elif b.get("mode") == "claude":
+            claude_file = _decision_file_for(t, used)
         discussion = (claude_file or {}).get("discussion") or []
         msgs = []
 
@@ -229,6 +237,42 @@ def chat() -> dict:
     return {"generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "roles": ROLES, "runs": runs}
 
 
+DATA_BRANCH = "dashboard-data"
+
+
+def push_to_github(paths: list[Path]) -> str:
+    """Legt die Dashboard-Dateien als einzelnen Commit auf den Branch `dashboard-data`
+    (ohne den Arbeitsordner oder main anzufassen) und pusht ihn. Die Artefakte lesen sie
+    dort über den GitHub-Connector. Abschalten: in settings.json "dashboard_git_push": false."""
+    import os
+    import subprocess
+
+    try:
+        cfg = json.loads((ROOT / "settings.json").read_text(encoding="utf-8")) if (ROOT / "settings.json").exists() else {}
+    except Exception:
+        cfg = {}
+    if cfg.get("dashboard_git_push") is False:
+        return "GitHub-Push abgeschaltet"
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="tradingbot", GIT_AUTHOR_EMAIL="tradingbot@localhost",
+               GIT_COMMITTER_NAME="tradingbot", GIT_COMMITTER_EMAIL="tradingbot@localhost")
+
+    def git(*args, inp=None):
+        r = subprocess.run(["git", *args], cwd=ROOT, input=inp, capture_output=True, text=True, env=env, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()[:200])
+        return r.stdout.strip()
+
+    entries = []
+    for f in paths:
+        sha = git("hash-object", "-w", str(f))
+        entries.append(f"100644 blob {sha}\t{f.name}")
+    tree = git("mktree", inp="\n".join(entries) + "\n")
+    stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    commit = git("commit-tree", tree, "-m", f"Dashboard-Daten {stamp}")
+    git("push", "--force", "--quiet", "origin", f"{commit}:refs/heads/{DATA_BRANCH}")
+    return f"nach GitHub ({DATA_BRANCH}) gepusht"
+
+
 def main():
     sec = Secrets()
     http.set_redactor(sec.redact)
@@ -239,12 +283,19 @@ def main():
         pf = {"generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
               "errors": [f"Alpaca nicht erreichbar: {sec.redact(str(e))[:200]}"]}
     ch = chat()
-    for name, data in (("portfolio.json", pf), ("chat.json", ch)):
+    outputs = [("chat.json", ch)]
+    if "account" in pf or not (OUT / "portfolio.json").exists():
+        outputs.insert(0, ("portfolio.json", pf))  # bei Alpaca-Ausfall den letzten guten Stand behalten
+    for name, data in outputs:
         txt = json.dumps(data, ensure_ascii=False, default=str)
         txt = sec.redact(txt)  # Sicherheitsnetz: niemals Keys exportieren
         (OUT / name).write_text(txt, encoding="utf-8")
     print(f"Dashboard-Daten: {OUT}/portfolio.json ({len(pf.get('positions', []))} Positionen, "
           f"{len(pf.get('orders', []))} Orders), chat.json ({len(ch['runs'])} Runden)")
+    try:
+        print("Dashboard-Daten", push_to_github([OUT / "portfolio.json", OUT / "chat.json"]))
+    except Exception as e:
+        print(f"Dashboard-Push nach GitHub fehlgeschlagen: {sec.redact(str(e))}")
     if pf.get("errors"):
         print("Hinweise:", "; ".join(pf["errors"]))
 
